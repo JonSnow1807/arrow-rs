@@ -1,0 +1,46 @@
+name: bench-11543
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'bench-11543-*'
+jobs:
+  bench:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: arm, runner: ubuntu-24.04-arm, rustflags: "" }
+          - { name: x86, runner: ubuntu-24.04, rustflags: "" }
+          - { name: x86-bmi2, runner: ubuntu-24.04, rustflags: "-C target-feature=+bmi2" }
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      BRANCH: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustc -vV
+      - name: CPU info
+        run: |
+          mkdir -p out
+          { uname -a; lscpu; echo; grep -m1 -E 'model name|CPU part|Features' /proc/cpuinfo; echo "--- cpu part/implementer:"; grep -m2 -E 'CPU implementer|CPU part' /proc/cpuinfo; echo "--- bmi2 flag:"; grep -o -m1 -w bmi2 /proc/cpuinfo || echo "no bmi2 flag"; echo "RUSTFLAGS='$RUSTFLAGS'"; nproc; } | tee out/cpu.txt
+      - name: Bench 1/16 rows
+        run: |
+          cargo bench -p arrow-select --bench filter_bits -- "kept 1/16" --save-baseline "$BRANCH" \
+            --sample-size 100 --warm-up-time 3 --measurement-time 5 2>&1 | tee out/bench_1_16.txt
+      - name: Bench sparse and dense context rows
+        run: |
+          cargo bench -p arrow-select --bench filter_bits -- "random, kept" --save-baseline "${BRANCH}-ctx" \
+            --sample-size 100 --warm-up-time 3 --measurement-time 5 2>&1 | tee out/bench_ctx.txt
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}-${{ github.ref_name }}-${{ github.run_attempt }}
+          path: |
+            out/
+            target/criterion/

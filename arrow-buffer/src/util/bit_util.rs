@@ -91,6 +91,12 @@ pub fn compress(value: u64, mask: u64) -> u64 {
 #[inline(always)]
 fn compress_portable(value: u64, mask: u64) -> u64 {
     let kept = mask.count_ones();
+    compress_portable_with_kept(value, mask, kept)
+}
+
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "bmi2"))))]
+#[inline(always)]
+fn compress_portable_with_kept(value: u64, mask: u64, kept: u32) -> u64 {
     if kept <= 2 {
         let lowest = mask & mask.wrapping_neg();
         let second = mask ^ lowest;
@@ -131,6 +137,49 @@ fn compress_portable(value: u64, mask: u64) -> u64 {
         value
     } else {
         compress_bytes(value, mask)
+    }
+}
+
+/// Compress eight words, preserving a separate packed result for each word.
+///
+/// Sparse blocks share one set-bit loop across all their words. Other blocks
+/// use the same per-word strategy as [`compress`]. Eight words amortize the
+/// sparse loop's exit and dispatch while keeping its state small.
+#[inline]
+pub fn compress_block(values: &[u64; 8], masks: &[u64; 8]) -> [u64; 8] {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        std::array::from_fn(|i| compress(values[i], masks[i]))
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let kept = masks.map(u64::count_ones);
+        let total: u32 = kept.iter().sum();
+        // At two bits per word or less, the loop-free per-word path wins.
+        if total <= 16 || total > 64 || kept.iter().any(|&count| count > 16) {
+            return std::array::from_fn(|i| {
+                compress_portable_with_kept(values[i], masks[i], kept[i])
+            });
+        }
+
+        let mut result = [0; 8];
+        let mut remaining_masks = *masks;
+        let mut index = 0;
+        let mut dest_bit = 1_u64;
+        for _ in 0..total {
+            while remaining_masks[index] == 0 {
+                index += 1;
+                dest_bit = 1;
+            }
+            let mask = remaining_masks[index];
+            let lowest = mask & mask.wrapping_neg();
+            let keep = ((values[index] & lowest) != 0) as u64;
+            result[index] |= dest_bit & keep.wrapping_neg();
+            dest_bit <<= 1;
+            remaining_masks[index] = mask ^ lowest;
+        }
+        result
     }
 }
 
@@ -1146,6 +1195,54 @@ mod tests {
                 compress_reference(value, mask),
                 "value={value:#x} mask={mask:#x}"
             );
+        }
+    }
+
+    #[test]
+    fn test_compress_block() {
+        let value = [
+            0x0123_4567_89ab_cdef,
+            0xfedc_ba98_7654_3210,
+            u64::MAX,
+            0,
+            0xaaaa_aaaa_aaaa_aaaa,
+            0x5555_5555_5555_5555,
+            0x8000_0000_0000_0001,
+            0x1234_5678_9abc_def0,
+        ];
+        let cases = [
+            [0; 8],
+            [u64::MAX; 8],
+            [1, 0, 1 << 63, 0, 3, 0, 1 << 32, 0],
+            [u64::MAX, 0, !1, 0, !3, 0, u64::MAX, 0],
+            [1, 3, 7, 15, 31, 63, 127, 255],
+            [0, 0, 0, 0, 0, 0, 0, u64::MAX],
+            [0xffff, 0, 0, 0, 0, 0, 0, 0],
+            [0xffff, 1, 0, 0, 0, 0, 0, 0],
+            [0x1ffff, 1, 0, 0, 0, 0, 0, 0],
+            [0xffff, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0],
+            [0xffff, 0xffff, 0xffff, 0xffff, 1, 0, 0, 0],
+        ];
+        for masks in cases {
+            let actual = compress_block(&value, &masks);
+            let expected = std::array::from_fn(|i| compress_reference(value[i], masks[i]));
+            assert_eq!(actual, expected, "masks={masks:?}");
+        }
+
+        let mut rng = StdRng::seed_from_u64(11543);
+        for _ in 0..1024 {
+            let values = std::array::from_fn(|_| rng.random());
+            let masks = std::array::from_fn(|_| {
+                let word: u64 = rng.random();
+                match rng.random_range(0..4) {
+                    0 => word & rng.random::<u64>() & rng.random::<u64>(),
+                    1 => word | rng.random::<u64>() | rng.random::<u64>(),
+                    2 => word,
+                    _ => 0,
+                }
+            });
+            let expected = std::array::from_fn(|i| compress_reference(values[i], masks[i]));
+            assert_eq!(compress_block(&values, &masks), expected, "masks={masks:?}");
         }
     }
 

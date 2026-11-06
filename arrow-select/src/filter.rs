@@ -801,7 +801,8 @@ fn filter_bits_strategy(buffer: &BooleanBuffer, predicate: &FilterPredicate) -> 
 }
 
 /// Filter the packed bitmask `buffer` with `predicate` by extracting the kept
-/// bits of each 64-bit word with [`bit_util::compress`] (`pext`)
+/// bits of each 64-bit word with [`bit_util::compress`] (`pext`), dispatching
+/// complete blocks of words together on the portable path
 ///
 /// Not inlined: within `filter_array` the packing state spills to the stack
 #[inline(never)]
@@ -820,6 +821,11 @@ fn filter_bits_compress(buffer: &BooleanBuffer, predicate: &FilterPredicate) -> 
         #[inline(always)]
         fn push(&mut self, values: u64, mask: u64) {
             let bits = bit_util::compress(values, mask);
+            self.push_compressed(bits, mask);
+        }
+
+        #[inline(always)]
+        fn push_compressed(&mut self, bits: u64, mask: u64) {
             self.current |= bits << self.filled;
             let total = self.filled + mask.count_ones();
             if total < 64 {
@@ -857,13 +863,45 @@ fn filter_bits_compress(buffer: &BooleanBuffer, predicate: &FilterPredicate) -> 
         filled: 0,
     };
 
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     for (index, mask) in mask_chunks.iter().enumerate() {
-        // Words with no kept bits are skipped before the corresponding values
-        // are read, so only the mask is touched for them
-        if mask == 0 {
-            continue;
+        if mask != 0 {
+            packer.push(value_chunks.chunk(index), mask);
         }
-        packer.push(value_chunks.chunk(index), mask);
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let block_end = mask_chunks.chunk_len() / 8 * 8;
+        for start in (0..block_end).step_by(8) {
+            let masks: [u64; 8] = std::array::from_fn(|i| mask_chunks.chunk(start + i));
+            if masks == [0; 8] {
+                continue;
+            }
+            let values: [u64; 8] = std::array::from_fn(|i| {
+                if masks[i] == 0 {
+                    0
+                } else {
+                    value_chunks.chunk(start + i)
+                }
+            });
+            let compressed = bit_util::compress_block(&values, &masks);
+            for (bits, mask) in compressed.into_iter().zip(masks) {
+                if mask != 0 {
+                    packer.push_compressed(bits, mask);
+                }
+            }
+        }
+
+        for index in block_end..mask_chunks.chunk_len() {
+            let mask = mask_chunks.chunk(index);
+            // Words with no kept bits are skipped before the corresponding values
+            // are read, so only the mask is touched for them
+            if mask == 0 {
+                continue;
+            }
+            packer.push(value_chunks.chunk(index), mask);
+        }
     }
     packer.push(value_chunks.remainder_bits(), mask_chunks.remainder_bits());
 
@@ -1918,7 +1956,9 @@ mod tests {
 
         // Lengths exercising partial words, exact word multiples, and the
         // carry logic across flushed words
-        let lens = [0, 1, 7, 63, 64, 65, 127, 128, 200, 1024, 4099];
+        let lens = [
+            0, 1, 7, 63, 64, 65, 127, 128, 200, 511, 512, 513, 1024, 4099,
+        ];
         // Densities covering empty, sparse, balanced, dense and full masks
         let densities = [0.0, 0.01, 0.5, 0.9, 1.0];
         // Bit offsets of the value buffer, including non byte-aligned ones
