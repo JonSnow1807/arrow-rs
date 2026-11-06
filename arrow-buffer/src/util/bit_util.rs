@@ -1165,6 +1165,18 @@ mod tests {
         };
         let mut rng = StdRng::seed_from_u64(42);
 
+        // Exact sparse-path boundaries, rotated across both ends of the word.
+        for kept in [0, 1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 61, 62, 63, 64] {
+            let mask = u64::MAX.checked_shr(64 - kept).unwrap_or(0);
+            for rotation in 0..64 {
+                let mask = mask.rotate_left(rotation);
+                for value in [0, u64::MAX, 0xaaaa_aaaa_aaaa_aaaa, rng.random()] {
+                    check(value, mask);
+                    assert_eq!(compress(value, mask), compress_reference(value, mask));
+                }
+            }
+        }
+
         // Every mask with at most two kept or at most two dropped bits
         let value: u64 = rng.random();
         check(value, 0);
