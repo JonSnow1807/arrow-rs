@@ -820,8 +820,26 @@ fn filter_bits_compress(buffer: &BooleanBuffer, predicate: &FilterPredicate) -> 
         #[inline(always)]
         fn push(&mut self, values: u64, mask: u64) {
             let bits = bit_util::compress(values, mask);
+            self.push_compressed(bits, mask.count_ones());
+        }
+
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+        #[inline(always)]
+        fn push_counted(&mut self, values: u64, mask: u64, kept: u32) {
+            let bits = if kept <= 2 {
+                let lowest = mask & mask.wrapping_neg();
+                let second = mask ^ lowest;
+                u64::from(values & lowest != 0) | (u64::from(values & second != 0) << 1)
+            } else {
+                bit_util::compress(values, mask)
+            };
+            self.push_compressed(bits, kept);
+        }
+
+        #[inline(always)]
+        fn push_compressed(&mut self, bits: u64, kept: u32) {
             self.current |= bits << self.filled;
-            let total = self.filled + mask.count_ones();
+            let total = self.filled + kept;
             if total < 64 {
                 self.filled = total;
             } else {
@@ -857,6 +875,7 @@ fn filter_bits_compress(buffer: &BooleanBuffer, predicate: &FilterPredicate) -> 
         filled: 0,
     };
 
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     for (index, mask) in mask_chunks.iter().enumerate() {
         // Words with no kept bits are skipped before the corresponding values
         // are read, so only the mask is touched for them
@@ -864,6 +883,32 @@ fn filter_bits_compress(buffer: &BooleanBuffer, predicate: &FilterPredicate) -> 
             continue;
         }
         packer.push(value_chunks.chunk(index), mask);
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let end = mask_chunks.chunk_len() / 2 * 2;
+        for index in (0..end).step_by(2) {
+            let first = mask_chunks.chunk(index);
+            let second = mask_chunks.chunk(index + 1);
+            if first | second == 0 {
+                continue;
+            }
+            let first_kept = first.count_ones();
+            let second_kept = second.count_ones();
+            if first_kept != 0 {
+                packer.push_counted(value_chunks.chunk(index), first, first_kept);
+            }
+            if second_kept != 0 {
+                packer.push_counted(value_chunks.chunk(index + 1), second, second_kept);
+            }
+        }
+        for index in end..mask_chunks.chunk_len() {
+            let mask = mask_chunks.chunk(index);
+            if mask != 0 {
+                packer.push(value_chunks.chunk(index), mask);
+            }
+        }
     }
     packer.push(value_chunks.remainder_bits(), mask_chunks.remainder_bits());
 
@@ -1918,9 +1963,21 @@ mod tests {
 
         // Lengths exercising partial words, exact word multiples, and the
         // carry logic across flushed words
-        let lens = [0, 1, 7, 63, 64, 65, 127, 128, 200, 1024, 4099];
+        let lens = [
+            0, 1, 7, 63, 64, 65, 127, 128, 200, 255, 256, 257, 511, 512, 513, 1024, 4099,
+        ];
         // Densities covering empty, sparse, balanced, dense and full masks
-        let densities = [0.0, 0.01, 0.5, 0.9, 1.0];
+        let densities = [
+            0.0,
+            1.0 / 1024.0,
+            1.0 / 256.0,
+            0.01,
+            1.0 / 64.0,
+            1.0 / 16.0,
+            0.5,
+            0.9,
+            1.0,
+        ];
         // Bit offsets of the value buffer, including non byte-aligned ones
         let offsets = [0, 3, 8, 67];
         // Bit offsets of the filter, so the mask words are read unaligned too
