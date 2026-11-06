@@ -803,9 +803,21 @@ fn filter_bits_strategy(buffer: &BooleanBuffer, predicate: &FilterPredicate) -> 
 /// Filter the packed bitmask `buffer` with `predicate` by extracting the kept
 /// bits of each 64-bit word with [`bit_util::compress`] (`pext`)
 ///
-/// Not inlined: within `filter_array` the packing state spills to the stack
-#[inline(never)]
+#[inline]
 fn filter_bits_compress(buffer: &BooleanBuffer, predicate: &FilterPredicate) -> Buffer {
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    if predicate.count <= predicate.filter.len() / 12 {
+        return filter_bits_compress_impl::<true>(buffer, predicate);
+    }
+    filter_bits_compress_impl::<false>(buffer, predicate)
+}
+
+// Not inlined: keep the packing state separate from `filter_array`.
+#[inline(never)]
+fn filter_bits_compress_impl<const SPARSE: bool>(
+    buffer: &BooleanBuffer,
+    predicate: &FilterPredicate,
+) -> Buffer {
     /// Packs the bits extracted from successive words into the low `filled`
     /// bits of `current`; once complete it is written at `idx` and restarts
     /// from the bits that did not fit
@@ -820,8 +832,46 @@ fn filter_bits_compress(buffer: &BooleanBuffer, predicate: &FilterPredicate) -> 
         #[inline(always)]
         fn push(&mut self, values: u64, mask: u64) {
             let bits = bit_util::compress(values, mask);
+            self.push_compressed(bits, mask.count_ones());
+        }
+
+        #[inline(always)]
+        fn push_sparse(&mut self, values: &BitChunks<'_>, index: usize, mask: u64) {
+            if mask == 0 {
+                return;
+            }
+            let value = values.chunk(index);
+            let rest = mask & mask.wrapping_sub(1);
+            let mut remaining = rest & rest.wrapping_sub(1);
+            let mut bits = u64::from(value & (mask ^ rest) != 0)
+                | (u64::from(value & (rest ^ remaining) != 0) << 1);
+            let kept = if remaining == 0 {
+                1 + u32::from(rest != 0)
+            } else {
+                let kept = mask.count_ones();
+                if kept > 16 {
+                    self.push(value, mask);
+                    return;
+                }
+                let mut shift = 2;
+                while remaining != 0 {
+                    let rest = remaining & remaining.wrapping_sub(1);
+                    let next = rest & rest.wrapping_sub(1);
+                    let pair = u64::from(value & (remaining ^ rest) != 0)
+                        | (u64::from(value & (rest ^ next) != 0) << 1);
+                    bits |= pair << shift;
+                    remaining = next;
+                    shift += 2;
+                }
+                kept
+            };
+            self.push_compressed(bits, kept);
+        }
+
+        #[inline(always)]
+        fn push_compressed(&mut self, bits: u64, kept: u32) {
             self.current |= bits << self.filled;
-            let total = self.filled + mask.count_ones();
+            let total = self.filled + kept;
             if total < 64 {
                 self.filled = total;
             } else {
@@ -857,13 +907,35 @@ fn filter_bits_compress(buffer: &BooleanBuffer, predicate: &FilterPredicate) -> 
         filled: 0,
     };
 
-    for (index, mask) in mask_chunks.iter().enumerate() {
-        // Words with no kept bits are skipped before the corresponding values
-        // are read, so only the mask is touched for them
-        if mask == 0 {
-            continue;
+    if SPARSE {
+        let mut end = 0;
+        if predicate.count <= predicate.filter.len() / 128 {
+            end = mask_chunks.chunk_len() / 4 * 4;
+            for index in (0..end).step_by(4) {
+                let m0 = mask_chunks.chunk(index);
+                let m1 = mask_chunks.chunk(index + 1);
+                let m2 = mask_chunks.chunk(index + 2);
+                let m3 = mask_chunks.chunk(index + 3);
+                if m0 | m1 | m2 | m3 == 0 {
+                    continue;
+                }
+                packer.push_sparse(&value_chunks, index, m0);
+                packer.push_sparse(&value_chunks, index + 1, m1);
+                packer.push_sparse(&value_chunks, index + 2, m2);
+                packer.push_sparse(&value_chunks, index + 3, m3);
+            }
         }
-        packer.push(value_chunks.chunk(index), mask);
+        for (index, mask) in mask_chunks.iter().enumerate().skip(end) {
+            packer.push_sparse(&value_chunks, index, mask);
+        }
+    } else {
+        for (index, mask) in mask_chunks.iter().enumerate() {
+            // Skip empty masks before reading the corresponding values.
+            if mask == 0 {
+                continue;
+            }
+            packer.push(value_chunks.chunk(index), mask);
+        }
     }
     packer.push(value_chunks.remainder_bits(), mask_chunks.remainder_bits());
 
@@ -1918,9 +1990,21 @@ mod tests {
 
         // Lengths exercising partial words, exact word multiples, and the
         // carry logic across flushed words
-        let lens = [0, 1, 7, 63, 64, 65, 127, 128, 200, 1024, 4099];
+        let lens = [
+            0, 1, 7, 63, 64, 65, 127, 128, 200, 255, 256, 257, 511, 512, 513, 1024, 4099,
+        ];
         // Densities covering empty, sparse, balanced, dense and full masks
-        let densities = [0.0, 0.01, 0.5, 0.9, 1.0];
+        let densities = [
+            0.0,
+            1.0 / 1024.0,
+            1.0 / 256.0,
+            0.01,
+            1.0 / 64.0,
+            1.0 / 16.0,
+            0.5,
+            0.9,
+            1.0,
+        ];
         // Bit offsets of the value buffer, including non byte-aligned ones
         let offsets = [0, 3, 8, 67];
         // Bit offsets of the filter, so the mask words are read unaligned too
@@ -1980,6 +2064,44 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn test_filter_bits_sparse_mixed_words() {
+        let mut rng = StdRng::seed_from_u64(11543);
+        for counts in [
+            [0, 0, 0, 0],
+            [1, 2, 3, 4],
+            [0, 16, 1, 17],
+            [0, 64, 0, 0],
+            [16, 1, 0, 0],
+            [16, 16, 16, 16],
+        ] {
+            for offset in [0, 3, 67] {
+                let len = 2051;
+                let values: BooleanBuffer =
+                    (0..len + offset).map(|_| rng.random_bool(0.5)).collect();
+                let values = values.slice(offset, len);
+                let mut mask = vec![false; len + offset];
+                for (word, kept) in counts.into_iter().enumerate() {
+                    for bit in 0..kept {
+                        mask[offset + word * 64 + (bit * 17) % 64] = true;
+                    }
+                }
+                // Include a partial word after a long run of empty words.
+                mask[offset + len - 1] = true;
+                let filter = BooleanArray::from(mask).slice(offset, len);
+                let predicate = FilterBuilder::new(&filter).build();
+                let expected: BooleanBuffer = values
+                    .iter()
+                    .zip(filter.values().iter())
+                    .filter_map(|(value, keep)| keep.then_some(value))
+                    .collect();
+                let actual = filter_bits_compress(&values, &predicate);
+                let actual = BooleanBuffer::new(actual, 0, predicate.count);
+                assert_eq!(actual, expected, "counts={counts:?} offset={offset}");
             }
         }
     }

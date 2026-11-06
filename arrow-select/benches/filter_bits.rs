@@ -89,6 +89,7 @@ fn add_benchmark(c: &mut Criterion) {
         ("indices, kept 1/64", 1.0 / 64.0),
         ("indices, kept 1/256", 1.0 / 256.0),
         ("indices, kept 1/1024", 1.0 / 1024.0),
+        ("indices, kept 1/16", 1.0 / 16.0),
     ];
 
     for (label, true_density) in cases {
